@@ -1,8 +1,8 @@
 <script lang="ts" setup>
 import { fromUint8Array } from 'js-base64'
 import { blockToBinary, createEncoder, type EncodedBlock, type LtEncoder } from 'luby-transform'
-import { encode, renderSVG } from 'uqr'
-import { GIF_PALETTE, gifFilename, qrMatrixToIndexedPixels } from '~~/utils/gif'
+import { renderSVG } from 'uqr'
+import { gifFilename, resolveGifFrameCount } from '~~/utils/gif'
 import { useKiloBytesNumberFormat } from '~/composables/intlNumberFormat'
 
 const props = withDefaults(defineProps<{
@@ -19,9 +19,11 @@ const props = withDefaults(defineProps<{
 })
 
 const count = ref(0)
+const blockCount = ref(0)
 let encoder: LtEncoder
 watch(() => [props.data, props.sliceSize], () => {
   encoder = createEncoder(props.data, props.sliceSize)
+  blockCount.value = encoder.k
 }, { immediate: true })
 const svg = ref<string>()
 const block = shallowRef<EncodedBlock>()
@@ -32,42 +34,51 @@ const bytes = useKiloBytesNumberFormat(computed(() => ((block.value?.bytes || 0)
 
 const GIF_SIZE_OPTIONS = [256, 384, 512, 768, 1024]
 const DEFAULT_GIF_SIZE = 512
-const gifFrameCount = ref(60)
+const frameMode = ref<'multiplier' | 'frames'>('multiplier')
+const gifMultiplier = ref<number | string>(1.5)
+const customFrameCount = ref<number | string>(60)
+const frameModes = [{ value: 'multiplier', label: 'By multiplier' }, { value: 'frames', label: 'Exact frames' }] as const
+const gifFrameCount = computed(() => resolveGifFrameCount(
+  blockCount.value,
+  frameMode.value,
+  frameMode.value === 'multiplier' ? gifMultiplier.value : customFrameCount.value,
+) ?? 0)
 const gifFps = ref(10)
 const gifSize = ref(DEFAULT_GIF_SIZE)
 const isExporting = ref(false)
 const exportProgress = ref(0)
 const exportError = ref('')
 const exportSize = ref(0)
-const cancelExportRequested = ref(false)
-const recommendedFrameCount = computed(() => Math.min(500, Math.max(30, Math.ceil((block.value?.k || 20) * 1.5))))
+let exportController: AbortController | undefined
+let isMounted = false
 const exportDuration = computed(() => gifFrameCount.value / gifFps.value)
 
 let pauseLive = () => {}
 let resumeLive = () => {}
 
-function nextEncodedText(targetEncoder: LtEncoder) {
-  const nextBlock = targetEncoder.fountain().next().value
-  return props.prefix + fromUint8Array(blockToBinary(nextBlock))
-}
+let previousFrameTime = 0
 
 function renderNextFrame() {
-  const frameStart = performance.now()
   const data = encoder.fountain().next().value
   block.value = data
   const binary = blockToBinary(data)
   const str = fromUint8Array(binary)
   svg.value = renderSVG(props.prefix + str, { border: 5 })
-  renderTime.value = performance.now() - frameStart
+  const now = performance.now()
+  renderTime.value = now - previousFrameTime
+  previousFrameTime = now
   count.value++
 }
 
-function useRecommendedFrameCount() {
-  gifFrameCount.value = recommendedFrameCount.value
+/** Seed exact mode from the current count while retaining the multiplier on return. */
+function setFrameMode(mode: 'multiplier' | 'frames') {
+  if (mode === 'frames' && frameMode.value !== mode)
+    customFrameCount.value = gifFrameCount.value || 60
+  frameMode.value = mode
 }
 
 function cancelExport() {
-  cancelExportRequested.value = true
+  exportController?.abort()
 }
 
 function download(bytes: Uint8Array) {
@@ -81,74 +92,68 @@ function download(bytes: Uint8Array) {
 }
 
 async function exportGif() {
-  if (isExporting.value)
+  if (isExporting.value || !gifFrameCount.value)
     return
 
-  gifFrameCount.value = Math.min(500, Math.max(10, Math.round(Number(gifFrameCount.value) || recommendedFrameCount.value)))
+  const frames = gifFrameCount.value
   gifFps.value = Math.min(30, Math.max(1, Math.round(Number(gifFps.value) || 10)))
   if (!GIF_SIZE_OPTIONS.includes(gifSize.value))
     gifSize.value = DEFAULT_GIF_SIZE
 
   isExporting.value = true
-  cancelExportRequested.value = false
+  const controller = new AbortController()
+  exportController = controller
   exportProgress.value = 0
   exportError.value = ''
   exportSize.value = 0
   pauseLive()
 
   try {
-    const { GIFEncoder } = await import('gifenc')
-    const gif = GIFEncoder()
-    const exportEncoder = createEncoder(props.data, props.sliceSize)
-    const delay = Math.round(1000 / gifFps.value)
-
-    for (let frame = 0; frame < gifFrameCount.value; frame++) {
-      if (cancelExportRequested.value)
-        return
-
-      const qr = encode(nextEncodedText(exportEncoder))
-      const pixels = qrMatrixToIndexedPixels(qr.data, gifSize.value, 5)
-      gif.writeFrame(pixels, gifSize.value, gifSize.value, {
-        palette: frame === 0 ? GIF_PALETTE : undefined,
-        delay,
-        repeat: 0,
-      })
-
-      exportProgress.value = frame + 1
-      if (frame % 4 === 3)
-        await new Promise(resolve => setTimeout(resolve, 0))
+    const options = {
+      data: props.data,
+      sliceSize: props.sliceSize,
+      frames,
+      fps: gifFps.value,
+      size: gifSize.value,
+      prefix: props.prefix,
+      signal: controller.signal,
+      onProgress: (frames: number) => { exportProgress.value = frames },
     }
-
-    gif.finish()
-    const output = gif.bytes()
+    const { encodeGif } = await import('~~/utils/gif-export')
+    const output = await encodeGif(options)
+    if (!output || controller.signal.aborted)
+      return
     exportSize.value = output.byteLength
     download(output)
   }
   catch (error) {
-    exportError.value = error instanceof Error ? error.message : String(error)
+    if (!controller.signal.aborted)
+      exportError.value = error instanceof Error ? error.message : String(error)
   }
   finally {
     isExporting.value = false
-    resumeLive()
+    exportController = undefined
+    if (isMounted) {
+      previousFrameTime = performance.now()
+      resumeLive()
+    }
   }
 }
 
 onMounted(() => {
+  isMounted = true
+  previousFrameTime = performance.now()
   const controls = useIntervalFn(renderNextFrame, () => 1000 / props.maxScansPerSecond)
   pauseLive = controls.pause
   resumeLive = controls.resume
 })
 
-onBeforeUnmount(() => {
-  cancelExportRequested.value = true
-  pauseLive()
-})
+watch(() => [props.data, props.sliceSize, props.prefix], cancelExport)
 
-watch(recommendedFrameCount, (recommended, previous) => {
-  if (!previous || gifFrameCount.value === previous)
-    gifFrameCount.value = recommended
-}, {
-  immediate: true,
+onBeforeUnmount(() => {
+  isMounted = false
+  exportController?.abort()
+  pauseLive()
 })
 </script>
 
@@ -182,19 +187,44 @@ watch(recommendedFrameCount, (recommended, previous) => {
         </span>
       </template>
       <div flex flex-col gap-4 p-4>
-        <div grid="~ cols-1 sm:cols-3" gap-4>
-          <label flex flex-col gap-1 text-sm>
-            <span text-neutral-500>Frames</span>
-            <input
-              v-model.number="gifFrameCount"
-              type="number"
-              min="10"
-              max="500"
-              :disabled="isExporting"
-              border="~ gray/25 rounded-lg"
-              bg-transparent px-2 py-1
+        <fieldset :disabled="isExporting" flex flex-col gap-3>
+          <legend mb-2 text-sm font-medium>
+            Sequence length
+          </legend>
+          <div flex flex-wrap gap-2>
+            <label
+              v-for="option in frameModes" :key="option.value"
+              :class="frameMode === option.value ? 'border-blue bg-blue/10 text-blue' : 'border-gray/25 text-neutral-500'"
+              flex cursor-pointer items-center gap-2 border rounded-lg px-3 py-2 text-sm
             >
+              <input type="radio" name="gif-frame-mode" :value="option.value" :checked="frameMode === option.value" @change="setFrameMode(option.value)">
+              {{ option.label }}
+            </label>
+          </div>
+          <div v-if="frameMode === 'multiplier'" flex flex-col gap-2>
+            <label flex flex-col gap-1 text-sm>
+              <span text-neutral-500>Frames per data block</span>
+              <div flex items-center gap-2>
+                <input v-model.number="gifMultiplier" type="number" min="0.1" step="any" border="~ gray/25 rounded-lg" w-28 bg-transparent px-3 py-2>
+                <span text-neutral-500>× {{ blockCount }} blocks</span>
+              </div>
+            </label>
+            <div flex flex-wrap gap-2>
+              <button
+                v-for="multiple in [1.5, 2, 3]" :key="multiple" type="button"
+                :class="gifMultiplier === multiple ? 'bg-blue/15 text-blue' : 'bg-gray/10 text-neutral-500'"
+                rounded-md px-3 py-1 text-sm disabled:op-40 @click="gifMultiplier = multiple"
+              >
+                {{ multiple }}×{{ multiple === 1.5 ? ' · Default' : '' }}
+              </button>
+            </div>
+          </div>
+          <label v-else flex flex-col gap-1 text-sm>
+            <span text-neutral-500>Number of frames</span>
+            <input v-model.number="customFrameCount" type="number" min="1" step="1" border="~ gray/25 rounded-lg" w-28 bg-transparent px-3 py-2>
           </label>
+        </fieldset>
+        <div grid="~ cols-1 sm:cols-2" gap-4>
           <label flex flex-col gap-1 text-sm>
             <span text-neutral-500>Playback FPS</span>
             <input
@@ -221,19 +251,18 @@ watch(recommendedFrameCount, (recommended, previous) => {
             </select>
           </label>
         </div>
-        <div flex="~ col sm:row" items-start justify-between gap-2 text-sm>
-          <p text-neutral-500>
-            Recommended: {{ recommendedFrameCount }} frames · Duration: {{ exportDuration.toFixed(1) }}s
+        <div aria-live="polite" rounded-lg bg-gray:10 p-3 text-sm>
+          <template v-if="gifFrameCount">
+            <p font-medium>
+              {{ gifFrameCount }} frames · {{ exportDuration.toFixed(1) }}s
+            </p>
+            <p text-neutral-500>
+              {{ blockCount }} data blocks · {{ (gifFrameCount / blockCount).toFixed(2) }}× effective
+            </p>
+          </template>
+          <p v-else text-red role="alert">
+            Enter a positive {{ frameMode === 'multiplier' ? 'multiplier' : 'whole number of frames' }}.
           </p>
-          <button
-            type="button"
-            :disabled="isExporting || gifFrameCount === recommendedFrameCount"
-            text-blue hover="text-blue-400"
-            disabled:cursor-not-allowed disabled:op-40
-            @click="useRecommendedFrameCount"
-          >
-            Use recommended
-          </button>
         </div>
         <div v-if="isExporting" flex flex-col gap-2>
           <div h-2 overflow-hidden rounded-full bg-gray:20>
@@ -260,8 +289,9 @@ watch(recommendedFrameCount, (recommended, previous) => {
           type="button"
           bg="neutral-800 dark:neutral-100"
           text="white dark:neutral-900"
-          flex items-center justify-center gap-2 rounded-lg px-4 py-2
-          hover:op-85
+
+          :disabled="!gifFrameCount"
+          flex items-center justify-center gap-2 rounded-lg px-4 py-2 disabled:cursor-not-allowed disabled:op-40 hover:op-85
           @click="exportGif"
         >
           <span i-carbon:download inline-block />

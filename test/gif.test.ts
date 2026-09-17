@@ -1,6 +1,9 @@
-import { describe, expect, it } from 'vitest'
 import { GIFEncoder } from 'gifenc'
+import { fromUint8Array, toUint8Array } from 'js-base64'
+import jsQR from 'jsqr-es6'
 import { encode } from 'uqr'
+import { describe, expect, it } from 'vitest'
+import { binaryToBlock, blockToBinary, createDecoder, createEncoder } from '../packages/luby-transform/src'
 import { GIF_PALETTE, gifFilename, qrMatrixToIndexedPixels } from '../utils/gif'
 
 describe('qrMatrixToIndexedPixels', () => {
@@ -61,4 +64,27 @@ it('encodes multiple QR matrices as a valid animated GIF', () => {
   expect(signature).toBe('GIF89a')
   expect(output.byteLength).toBeGreaterThan(1000)
   expect(output.at(-1)).toBe(0x3B)
+})
+
+it('recovers a multi-block file from the exact QR pixels used by GIF frames', () => {
+  const data = new TextEncoder().encode('A transfer with multiple QR frames and a URL prefix.')
+  const encoder = createEncoder(data, 16)
+  const decoder = createDecoder()
+  const prefix = 'https://example.com/scan#'
+  expect(encoder.k).toBeGreaterThan(1)
+
+  for (let index = 0; index < encoder.k; index++) {
+    const binary = blockToBinary(encoder.createBlock([index]))
+    const qr = encode(prefix + fromUint8Array(binary))
+    const pixels = qrMatrixToIndexedPixels(qr.data, 256, 5)
+    const rgba = new Uint8ClampedArray(pixels.length * 4)
+    for (let pixel = 0; pixel < pixels.length; pixel++) {
+      const color = pixels[pixel] === 0 ? 255 : 0
+      rgba.set([color, color, color, 255], pixel * 4)
+    }
+    const scanned = jsQR(rgba, 256, 256)
+    expect(scanned?.data.startsWith(prefix)).toBe(true)
+    decoder.addBlock(binaryToBlock(toUint8Array(scanned!.data.slice(prefix.length))))
+  }
+  expect(decoder.getDecoded()).toEqual(data)
 })

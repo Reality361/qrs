@@ -53,3 +53,14 @@ export function gifFilename(filename?: string): string {
 
   return `${safeName || 'qrs-transfer'}.gif`
 }
+
+/** Round block multiples up to whole frames; reject invalid or unrepresentable counts. */
+export function resolveGifFrameCount(blockCount: number, mode: 'multiplier' | 'frames', value: number | string) {
+  const amount = Number(value)
+  if (!Number.isFinite(amount) || amount <= 0 || (mode === 'frames' && !Number.isInteger(amount)))
+    return
+  const frames = mode === 'multiplier' ? Math.ceil(blockCount * amount) : amount
+  if (!Number.isSafeInteger(frames) || frames < 1)
+    return
+  return frames
+}

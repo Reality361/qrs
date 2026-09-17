@@ -54,13 +54,17 @@ Scientists have already achieved very mature research results on how to efficien
 ## Export an animated GIF
 
 After selecting a file on the **Send** page, expand **Save QR sequence as GIF**.
-Choose the number of frames, playback speed, and image size, then select
-**Export GIF**. The export uses a separate fountain-code encoder, so it does not
-change the live QR stream. GIF encoding is loaded only when it is needed and
-the QR modules are written directly as lossless black-and-white pixels.
+Choose a multiple of the data block count (1.5× by default) or an exact frame
+count, then set the playback speed and image size and select **Export GIF**.
+Frame counts are not capped. Larger sequences take longer to encode and use more
+memory. You can cancel an export while it is running.
 
-For reliable recovery, use at least the recommended frame count shown in the
-export panel. Larger files may need more frames and produce a larger GIF.
+The export uses a separate fountain-code encoder and pauses the live QR stream
+until it finishes. GIF encoding is loaded only when needed, and the QR modules
+are written directly as lossless black-and-white pixels. Before downloading,
+the exported sequence is decoded and compared with the input. If it cannot be
+recovered, increase the multiplier or frame count and try again. This check
+verifies the data in the sequence; camera scanning may still miss frames.
 
 ## Build & run
 
@@ -93,18 +97,6 @@ Alternatively, if you want to run the development server to test changes:
 ```bash
 pnpm run dev
 ```
-
-### Deploy to Netlify
-
-This repository includes a `netlify.toml` configured for static deployment:
-
-- Build command: `pnpm run generate`
-- Publish directory: `.output/public`
-- Node.js: 22
-- pnpm: 10.7.1
-
-Import the repository in Netlify and deploy it. Netlify reads these settings
-automatically; no additional build settings are required.
 
 **3. Serve the Project Locally**
 
